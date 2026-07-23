@@ -1,0 +1,63 @@
+name: Build and push images
+
+on:
+  push:
+    branches: [v0.4.0-cheehoo]
+    paths:
+      - 'docker/**'
+      - 'examples/dockerscaleset/**'
+      - '.github/workflows/build-images.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  RUNNER_IMAGE: ghcr.io/alex-cheehoo/gha-runner
+  CONTROLLER_IMAGE: ghcr.io/alex-cheehoo/gha-runner-controller
+
+jobs:
+  runner:
+    name: Build runner image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: docker/runner
+          push: true
+          tags: |
+            ${{ env.RUNNER_IMAGE }}:latest
+            ${{ env.RUNNER_IMAGE }}:${{ github.sha }}
+
+  controller:
+    name: Build controller image
+    needs: runner
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/controller/Dockerfile
+          build-args: RUNNER_IMAGE=${{ env.RUNNER_IMAGE }}:latest
+          push: true
+          tags: |
+            ${{ env.CONTROLLER_IMAGE }}:latest
+            ${{ env.CONTROLLER_IMAGE }}:${{ github.sha }}
