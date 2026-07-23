@@ -74,17 +74,42 @@ func run(ctx context.Context, c Config) error {
 		runnerGroupID = runnerGroup.ID
 	}
 
-	// Create the runner scale set
-	scaleSet, err := scalesetClient.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
-		Name:          c.ScaleSetName,
-		RunnerGroupID: runnerGroupID,
-		Labels:        c.BuildLabels(),
-		RunnerSetting: scaleset.RunnerSetting{
-			DisableUpdate: true,
-		},
-	})
+	// Get or create the runner scale set.
+	// Upstream blindly calls Create which fails on restart if the previous
+	// instance didn't deregister (crash, SIGKILL).  ARC's K8s controller
+	// uses Get-then-Create; we do the same.
+	scaleSet, err := scalesetClient.GetRunnerScaleSet(ctx, runnerGroupID, c.ScaleSetName)
 	if err != nil {
-		return fmt.Errorf("failed to create runner scale set: %w", err)
+		logger.Warn("GetRunnerScaleSet failed, falling back to Create",
+			slog.String("error", err.Error()))
+		scaleSet = nil
+	}
+	if scaleSet != nil {
+		logger.Info("Reusing existing runner scale set",
+			slog.Int("scaleSetID", scaleSet.ID))
+		scaleSet, err = scalesetClient.UpdateRunnerScaleSet(ctx, scaleSet.ID, &scaleset.RunnerScaleSet{
+			Name:          c.ScaleSetName,
+			RunnerGroupID: runnerGroupID,
+			Labels:        c.BuildLabels(),
+			RunnerSetting: scaleset.RunnerSetting{
+				DisableUpdate: true,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to update existing runner scale set: %w", err)
+		}
+	} else {
+		scaleSet, err = scalesetClient.CreateRunnerScaleSet(ctx, &scaleset.RunnerScaleSet{
+			Name:          c.ScaleSetName,
+			RunnerGroupID: runnerGroupID,
+			Labels:        c.BuildLabels(),
+			RunnerSetting: scaleset.RunnerSetting{
+				DisableUpdate: true,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to create runner scale set: %w", err)
+		}
 	}
 
 	// Set the user agent for the scaleset client now that we have the scale set ID
