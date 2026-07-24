@@ -104,7 +104,13 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 				fmt.Sprintf("ACTIONS_RUNNER_INPUT_JITCONFIG=%s", jit.EncodedJITConfig),
 			},
 		},
-		nil,
+		&container.HostConfig{
+			Binds: []string{
+				"/var/cache/pip:/home/runner/.cache/pip",
+				"/var/cache/npm:/home/runner/.npm",
+				"/var/cache/yarn:/home/runner/.cache/yarn",
+			},
+		},
 		nil, nil,
 		name,
 	)
