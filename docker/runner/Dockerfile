@@ -25,3 +25,10 @@ RUN sudo apt-get update \
     && corepack prepare yarn@stable --activate \
     # Cleanup
     && sudo rm -rf /var/lib/apt/lists/*
+
+# Pre-install Python versions into the hostedtoolcache so setup-python
+# skips the ~165s download per version.
+COPY install-python.sh /tmp/install-python.sh
+RUN chmod +x /tmp/install-python.sh \
+    && /tmp/install-python.sh 3.9 3.10 3.11 \
+    && rm /tmp/install-python.sh
