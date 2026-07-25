@@ -30,4 +30,4 @@ RUN sudo apt-get update \
 # skips the ~165s download per version.
 COPY --chmod=755 install-python.sh /tmp/install-python.sh
 RUN /tmp/install-python.sh 3.9 3.10 3.11 \
-    && rm /tmp/install-python.sh
+    && sudo rm /tmp/install-python.sh
