@@ -107,6 +107,7 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		&container.HostConfig{
 			Binds: []string{
 				"/var/cache/pip:/home/runner/.cache/pip",
+				"/var/cache/uv:/home/runner/.cache/uv",
 				"/var/cache/npm:/home/runner/.npm",
 				"/var/cache/yarn:/home/runner/.cache/yarn",
 			},
