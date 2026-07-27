@@ -23,8 +23,12 @@ RUN sudo apt-get update \
     && sudo apt-get install -y --no-install-recommends gh \
     # Yarn via corepack
     && corepack prepare yarn@stable --activate \
+    # uv (fast pip replacement)
+    && curl -LsSf https://astral.sh/uv/install.sh | sh \
     # Cleanup
     && sudo rm -rf /var/lib/apt/lists/*
+
+ENV PATH="/home/runner/.local/bin:${PATH}"
 
 # Pre-install Python versions into the hostedtoolcache so setup-python
 # skips the ~165s download per version.
