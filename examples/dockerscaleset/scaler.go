@@ -110,6 +110,7 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 				"/var/cache/uv:/home/runner/.cache/uv",
 				"/var/cache/npm:/home/runner/.npm",
 				"/var/cache/yarn:/home/runner/.cache/yarn",
+				"/var/cache/ms-playwright:/home/runner/.cache/ms-playwright",
 			},
 		},
 		nil, nil,
