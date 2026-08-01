@@ -112,6 +112,12 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 				"/var/cache/yarn:/home/runner/.cache/yarn",
 				"/var/cache/ms-playwright:/home/runner/.cache/ms-playwright",
 			},
+			CapAdd: []string{"NET_ADMIN"},
+			Resources: container.Resources{
+				Devices: []container.DeviceMapping{
+					{PathOnHost: "/dev/net/tun", PathInContainer: "/dev/net/tun", CgroupPermissions: "rwm"},
+				},
+			},
 		},
 		nil, nil,
 		name,
