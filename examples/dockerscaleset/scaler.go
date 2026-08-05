@@ -73,10 +73,20 @@ func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	a.logger.Info("Job completed", slog.Int64("runnerRequestId", jobInfo.RunnerRequestID), slog.String("jobId", jobInfo.JobID))
 
 	containerID := a.runners.markDone(jobInfo.RunnerName)
-	if err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
+	if err := a.removeContainer(ctx, containerID); err != nil {
 		return fmt.Errorf("failed to remove runner container: %w", err)
 	}
 
+	return nil
+}
+
+// removeContainer deletes a runner container. AutoRemove means the daemon
+// often gets there first, so an already-gone container is the success case.
+func (a *Scaler) removeContainer(ctx context.Context, containerID string) error {
+	err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+	if err != nil && !dockerclient.IsErrNotFound(err) {
+		return err
+	}
 	return nil
 }
 
@@ -105,6 +115,12 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 			},
 		},
 		&container.HostConfig{
+			// A JIT runner is single-use, so the daemon can reap it the moment it
+			// exits. Without this the only collector is this process, and anything
+			// it loses track of — every container alive across a controller restart
+			// — leaks forever: 70 orphans held 422 GB on the on-prem host and
+			// filled its disk.
+			AutoRemove: true,
 			Binds: []string{
 				"/var/cache/pip:/home/runner/.cache/pip",
 				"/var/cache/uv:/home/runner/.cache/uv",
@@ -141,7 +157,7 @@ func (a *Scaler) shutdown(ctx context.Context) {
 
 	for name, containerID := range a.runners.idle {
 		a.logger.Info("Removing idle runner", slog.String("name", name), slog.String("containerID", containerID))
-		if err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
+		if err := a.removeContainer(ctx, containerID); err != nil {
 			a.logger.Error("Failed to remove idle runner container", slog.String("name", name), slog.String("containerID", containerID), slog.String("error", err.Error()))
 		}
 	}
@@ -149,7 +165,7 @@ func (a *Scaler) shutdown(ctx context.Context) {
 
 	for name, containerID := range a.runners.busy {
 		a.logger.Info("Removing busy runner", slog.String("name", name), slog.String("containerID", containerID))
-		if err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true}); err != nil {
+		if err := a.removeContainer(ctx, containerID); err != nil {
 			a.logger.Error("Failed to remove busy runner container", slog.String("name", name), slog.String("containerID", containerID), slog.String("error", err.Error()))
 		}
 	}
