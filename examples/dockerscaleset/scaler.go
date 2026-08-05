@@ -73,15 +73,27 @@ func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	a.logger.Info("Job completed", slog.Int64("runnerRequestId", jobInfo.RunnerRequestID), slog.String("jobId", jobInfo.JobID))
 
 	containerID := a.runners.markDone(jobInfo.RunnerName)
+	// Not fatal. With AutoRemove the daemon owns the removal and this call is
+	// only belt-and-braces, so it can lose the race several ways — the
+	// container is already gone, or the daemon's own removal is mid-flight
+	// ("removal of container X is already in progress", a 409, not a 404).
+	// Returning any of those kills the listener, and the shutdown that follows
+	// force-removes every busy runner, so one lost race fails every job then
+	// running.
 	if err := a.removeContainer(ctx, containerID); err != nil {
-		return fmt.Errorf("failed to remove runner container: %w", err)
+		a.logger.Warn(
+			"Runner container removal failed; the daemon's AutoRemove is authoritative",
+			slog.String("name", jobInfo.RunnerName),
+			slog.String("containerID", containerID),
+			slog.String("error", err.Error()),
+		)
 	}
 
 	return nil
 }
 
-// removeContainer deletes a runner container. AutoRemove means the daemon
-// often gets there first, so an already-gone container is the success case.
+// removeContainer deletes a runner container, treating an already-removed one
+// as success — under AutoRemove that is the normal outcome, not a failure.
 func (a *Scaler) removeContainer(ctx context.Context, containerID string) error {
 	err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
 	if err != nil && !dockerclient.IsErrNotFound(err) {
