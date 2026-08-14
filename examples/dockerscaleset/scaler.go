@@ -82,7 +82,9 @@ func (a *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStar
 		slog.Int64("runnerRequestId", jobInfo.RunnerRequestID),
 		slog.String("jobId", jobInfo.JobID),
 	)
-	a.runners.markBusy(jobInfo.RunnerName)
+	if !a.runners.markBusy(jobInfo.RunnerName) {
+		a.logger.Warn("Job started on a runner this process does not own", slog.String("runner", jobInfo.RunnerName))
+	}
 	return nil
 }
 
@@ -90,6 +92,11 @@ func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	a.logger.Info("Job completed", slog.Int64("runnerRequestId", jobInfo.RunnerRequestID), slog.String("jobId", jobInfo.JobID))
 
 	containerID := a.runners.markDone(jobInfo.RunnerName)
+	if containerID == "" {
+		a.logger.Warn("Job completed on a runner this process does not own", slog.String("runner", jobInfo.RunnerName))
+		a.removeDindResources(ctx, jobInfo.RunnerName)
+		return nil
+	}
 	// Not fatal. With AutoRemove the daemon owns the removal and this call is
 	// only belt-and-braces, so it can lose the race several ways — the
 	// container is already gone, or the daemon's own removal is mid-flight
@@ -469,15 +476,21 @@ func (r *runnerState) count() int {
 	return count
 }
 
-func (r *runnerState) markBusy(name string) {
+// markBusy reports whether the runner was known. A JobStarted can name a
+// runner this process never made: one from a session that died, or a foreign
+// runner that shares the label and won the job. Panicking here killed the
+// listener, stranded every acquired job, and crash-looped on the next late
+// message.
+func (r *runnerState) markBusy(name string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	state, ok := r.idle[name]
 	if !ok {
-		panic("marking non-existent runner busy")
+		return false
 	}
 	delete(r.idle, name)
 	r.busy[name] = state
+	return true
 }
 
 func (r *runnerState) markDone(name string) string {
@@ -497,7 +510,10 @@ func (r *runnerState) markDoneUnlocked(name string) string {
 		delete(r.idle, name)
 		return containerID
 	}
-	panic("marking non-existent runner done")
+	// Unknown runner: see markBusy. Empty string tells the caller there is no
+	// container to remove; the dind sweep still runs and is a no-op when the
+	// name owns nothing.
+	return ""
 }
 
 func (r *runnerState) addIdle(name, containerID string) {
