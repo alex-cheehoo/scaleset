@@ -158,7 +158,7 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	}
 
 	// Init: copy runner externals into the shared volume.
-	if err := a.runInitContainer(ctx, name, volExternals); err != nil {
+	if err := a.runInitContainer(ctx, name, volExternals, volWork); err != nil {
 		cleanup()
 		return "", fmt.Errorf("failed to run init container: %w", err)
 	}
@@ -236,18 +236,25 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 
 // runInitContainer copies runner externals into the shared volume so dind can
 // access them.
-func (a *Scaler) runInitContainer(ctx context.Context, name, volExternals string) error {
+func (a *Scaler) runInitContainer(ctx context.Context, name, volExternals, volWork string) error {
 	initName := name + "-init"
 	c, err := a.dockerClient.ContainerCreate(
 		ctx,
 		&container.Config{
-			Image:  a.runnerImage,
-			Cmd:    []string{"cp", "-r", "/home/runner/externals/.", "/home/runner/tmpDir/"},
+			Image: a.runnerImage,
+			// Root, unlike ARC's init container: a k8s emptyDir is 0777, but a
+			// fresh Docker volume mounted where the image has no directory is
+			// root:0755 — as uid 1001 the cp exits 1 and the runner would later
+			// fail to write _work. Copy as root, then hand both to the runner.
+			User: "0",
+			Cmd: []string{"sh", "-c",
+				"cp -r /home/runner/externals/. /home/runner/tmpDir/ && chown -R runner:runner /home/runner/tmpDir /home/runner/_work"},
 			Labels: map[string]string{ownerLabel: name},
 		},
 		&container.HostConfig{
 			Mounts: []mount.Mount{
 				{Type: mount.TypeVolume, Source: volExternals, Target: "/home/runner/tmpDir"},
+				{Type: mount.TypeVolume, Source: volWork, Target: "/home/runner/_work"},
 			},
 		},
 		nil, nil,
