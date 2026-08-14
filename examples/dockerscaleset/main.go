@@ -152,6 +152,21 @@ func run(ctx context.Context, c Config) error {
 		return fmt.Errorf("failed to close image pull: %w", err)
 	}
 
+	// Every runner gets its own dind sidecar, and ContainerCreate does not pull.
+	logger.Info("Pulling dind image", slog.String("image", dindImage))
+	dindPull, err := dockerClient.ImagePull(ctx, dindImage, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to pull dind image: %w", err)
+	}
+
+	if _, err := io.ReadAll(dindPull); err != nil {
+		return fmt.Errorf("failed to read dind image pull response: %w", err)
+	}
+
+	if err := dindPull.Close(); err != nil {
+		return fmt.Errorf("failed to close dind image pull: %w", err)
+	}
+
 	// Get the name of the client which will be used as the owner
 	hostname, err := os.Hostname()
 	if err != nil {

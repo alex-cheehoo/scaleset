@@ -5,13 +5,19 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
 	"github.com/google/uuid"
 )
+
+// dindImage is pulled once at startup; ContainerCreate does not pull.
+const dindImage = "docker:dind"
 
 type Scaler struct {
 	runners        runnerState
@@ -89,6 +95,8 @@ func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 		)
 	}
 
+	a.removeDindResources(ctx, jobInfo.RunnerName)
+
 	return nil
 }
 
@@ -116,6 +124,43 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("failed to generate JIT config: %w", err)
 	}
 
+	// Create shared volumes for the dind sidecar architecture.
+	volSock := name + "-sock"
+	volWork := name + "-work"
+	volExternals := name + "-externals"
+	for _, v := range []string{volSock, volWork, volExternals} {
+		if _, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: v}); err != nil {
+			return "", fmt.Errorf("failed to create volume %s: %w", v, err)
+		}
+	}
+
+	cleanup := func() {
+		a.removeDindResources(context.WithoutCancel(ctx), name)
+	}
+
+	// Init: copy runner externals into the shared volume.
+	if err := a.runInitContainer(ctx, name, volExternals); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed to run init container: %w", err)
+	}
+
+	// Start the dind sidecar.
+	if err := a.startDind(ctx, name, volSock, volWork, volExternals); err != nil {
+		cleanup()
+		return "", fmt.Errorf("failed to start dind container: %w", err)
+	}
+
+	// Wait for dockerd inside dind to become ready.
+	if err := a.waitForDind(ctx, name+"-dind"); err != nil {
+		cleanup()
+		return "", fmt.Errorf("dind not ready: %w", err)
+	}
+
+	dindMounts := []mount.Mount{
+		{Type: mount.TypeVolume, Source: volSock, Target: "/var/run"},
+		{Type: mount.TypeVolume, Source: volWork, Target: "/home/runner/_work"},
+	}
+
 	c, err := a.dockerClient.ContainerCreate(
 		ctx,
 		&container.Config{
@@ -141,6 +186,7 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 				"/var/cache/ms-playwright:/home/runner/.cache/ms-playwright",
 			},
 			CapAdd: []string{"NET_ADMIN"},
+			Mounts: dindMounts,
 			Resources: container.Resources{
 				Devices: []container.DeviceMapping{
 					{PathOnHost: "/dev/net/tun", PathInContainer: "/dev/net/tun", CgroupPermissions: "rwm"},
@@ -151,15 +197,138 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		name,
 	)
 	if err != nil {
+		cleanup()
 		return "", fmt.Errorf("failed to create runner container: %w", err)
 	}
 
 	if err := a.dockerClient.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
+		cleanup()
 		return "", fmt.Errorf("failed to start runner container: %w", err)
 	}
 
 	a.runners.addIdle(name, c.ID)
 	return name, nil
+}
+
+// runInitContainer copies runner externals into the shared volume so dind can
+// access them.
+func (a *Scaler) runInitContainer(ctx context.Context, name, volExternals string) error {
+	initName := name + "-init"
+	c, err := a.dockerClient.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image: a.runnerImage,
+			Cmd:   []string{"cp", "-r", "/home/runner/externals/.", "/home/runner/tmpDir/"},
+		},
+		&container.HostConfig{
+			Mounts: []mount.Mount{
+				{Type: mount.TypeVolume, Source: volExternals, Target: "/home/runner/tmpDir"},
+			},
+		},
+		nil, nil,
+		initName,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create init container: %w", err)
+	}
+	defer func() {
+		_ = a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), c.ID, container.RemoveOptions{Force: true})
+	}()
+
+	if err := a.dockerClient.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("failed to start init container: %w", err)
+	}
+
+	waitCh, errCh := a.dockerClient.ContainerWait(ctx, c.ID, container.WaitConditionNotRunning)
+	select {
+	case result := <-waitCh:
+		if result.StatusCode != 0 {
+			return fmt.Errorf("init container exited with status %d", result.StatusCode)
+		}
+	case err := <-errCh:
+		return fmt.Errorf("waiting for init container: %w", err)
+	}
+	return nil
+}
+
+func (a *Scaler) startDind(ctx context.Context, name, volSock, volWork, volExternals string) error {
+	dindName := name + "-dind"
+	// Paths must match between dind and runner so daemon bind mounts resolve correctly.
+	c, err := a.dockerClient.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image: dindImage,
+			// --group=123: matches the docker group gid inside the runner image.
+			Cmd: []string{"dockerd", "--host=unix:///var/run/docker.sock", "--group=123"},
+		},
+		&container.HostConfig{
+			Privileged: true,
+			Mounts: []mount.Mount{
+				{Type: mount.TypeVolume, Source: volSock, Target: "/var/run"},
+				{Type: mount.TypeVolume, Source: volWork, Target: "/home/runner/_work"},
+				{Type: mount.TypeVolume, Source: volExternals, Target: "/home/runner/externals"},
+			},
+		},
+		nil, nil,
+		dindName,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create dind container: %w", err)
+	}
+
+	if err := a.dockerClient.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("failed to start dind container: %w", err)
+	}
+	return nil
+}
+
+// waitForDind polls "docker info" inside the dind container until dockerd is
+// ready, mirroring ARC's startupProbe (failureThreshold=24, periodSeconds=5).
+func (a *Scaler) waitForDind(ctx context.Context, dindName string) error {
+	const maxRetries = 24
+	const interval = 5 * time.Second
+
+	for i := range maxRetries {
+		exec, err := a.dockerClient.ContainerExecCreate(ctx, dindName, container.ExecOptions{
+			Cmd: []string{"docker", "info"},
+		})
+		if err != nil {
+			a.logger.Debug("dind exec create failed", slog.Int("attempt", i+1), slog.String("error", err.Error()))
+			time.Sleep(interval)
+			continue
+		}
+
+		if err := a.dockerClient.ContainerExecStart(ctx, exec.ID, container.ExecStartOptions{}); err != nil {
+			a.logger.Debug("dind exec start failed", slog.Int("attempt", i+1), slog.String("error", err.Error()))
+			time.Sleep(interval)
+			continue
+		}
+
+		inspect, err := a.dockerClient.ContainerExecInspect(ctx, exec.ID)
+		if err != nil || inspect.Running || inspect.ExitCode != 0 {
+			a.logger.Debug("dind not ready", slog.Int("attempt", i+1))
+			time.Sleep(interval)
+			continue
+		}
+
+		a.logger.Info("dind ready", slog.String("container", dindName), slog.Int("attempts", i+1))
+		return nil
+	}
+	return fmt.Errorf("dind container %s not ready after %d attempts", dindName, maxRetries)
+}
+
+// removeDindResources force-removes the dind container and its shared volumes.
+// Failures are logged but never propagated.
+func (a *Scaler) removeDindResources(ctx context.Context, runnerName string) {
+	dindName := runnerName + "-dind"
+	if err := a.dockerClient.ContainerRemove(ctx, dindName, container.RemoveOptions{Force: true}); err != nil && !dockerclient.IsErrNotFound(err) {
+		a.logger.Warn("Failed to remove dind container", slog.String("name", dindName), slog.String("error", err.Error()))
+	}
+	for _, v := range []string{runnerName + "-sock", runnerName + "-work", runnerName + "-externals"} {
+		if err := a.dockerClient.VolumeRemove(ctx, v, true); err != nil {
+			a.logger.Warn("Failed to remove volume", slog.String("volume", v), slog.String("error", err.Error()))
+		}
+	}
 }
 
 func (a *Scaler) shutdown(ctx context.Context) {
@@ -172,6 +341,7 @@ func (a *Scaler) shutdown(ctx context.Context) {
 		if err := a.removeContainer(ctx, containerID); err != nil {
 			a.logger.Error("Failed to remove idle runner container", slog.String("name", name), slog.String("containerID", containerID), slog.String("error", err.Error()))
 		}
+		a.removeDindResources(ctx, name)
 	}
 	clear(a.runners.idle)
 
@@ -180,6 +350,7 @@ func (a *Scaler) shutdown(ctx context.Context) {
 		if err := a.removeContainer(ctx, containerID); err != nil {
 			a.logger.Error("Failed to remove busy runner container", slog.String("name", name), slog.String("containerID", containerID), slog.String("error", err.Error()))
 		}
+		a.removeDindResources(ctx, name)
 	}
 	clear(a.runners.busy)
 }
