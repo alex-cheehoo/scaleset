@@ -2,7 +2,7 @@ FROM ghcr.io/actions/actions-runner:latest
 
 RUN sudo apt-get update \
     && sudo apt-get install -y --no-install-recommends \
-       curl jq unzip \
+       curl jq unzip zstd \
     # Node.js 20 via NodeSource
     && curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - \
     && sudo apt-get install -y --no-install-recommends nodejs \
