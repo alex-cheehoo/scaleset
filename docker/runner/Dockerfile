@@ -21,6 +21,14 @@ RUN sudo apt-get update \
        | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
     && sudo apt-get update \
     && sudo apt-get install -y --no-install-recommends gh \
+    # Azure CLI
+    && curl -fsSL https://packages.microsoft.com/keys/microsoft.asc \
+       | sudo gpg --dearmor -o /etc/apt/keyrings/microsoft.gpg \
+    && sudo chmod go+r /etc/apt/keyrings/microsoft.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/microsoft.gpg] https://packages.microsoft.com/repos/azure-cli/ $(lsb_release -cs) main" \
+       | sudo tee /etc/apt/sources.list.d/azure-cli.list > /dev/null \
+    && sudo apt-get update \
+    && sudo apt-get install -y --no-install-recommends azure-cli \
     # Yarn via corepack
     && corepack prepare yarn@stable --activate \
     # uv (fast pip replacement)
