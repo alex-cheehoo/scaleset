@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/actions/scaleset"
 	"github.com/actions/scaleset/listener"
@@ -152,6 +153,21 @@ func run(ctx context.Context, c Config) error {
 		return fmt.Errorf("failed to close image pull: %w", err)
 	}
 
+	// Every runner gets its own dind sidecar, and ContainerCreate does not pull.
+	logger.Info("Pulling dind image", slog.String("image", dindImage))
+	dindPull, err := dockerClient.ImagePull(ctx, dindImage, image.PullOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to pull dind image: %w", err)
+	}
+
+	if _, err := io.ReadAll(dindPull); err != nil {
+		return fmt.Errorf("failed to read dind image pull response: %w", err)
+	}
+
+	if err := dindPull.Close(); err != nil {
+		return fmt.Errorf("failed to close dind image pull: %w", err)
+	}
+
 	// Get the name of the client which will be used as the owner
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -190,6 +206,23 @@ func run(ctx context.Context, c Config) error {
 	}
 
 	defer scaler.shutdown(context.WithoutCancel(ctx))
+
+	// Sweep for dind containers and volumes orphaned by a previous process —
+	// their ownership lived in that process's memory. Repeat periodically to
+	// catch removals that failed transiently after the runner was untracked.
+	scaler.reapOrphans(ctx)
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				scaler.reapOrphans(ctx)
+			}
+		}
+	}()
 
 	logger.Info("Starting listener")
 	if err := listener.Run(ctx, scaler); !errors.Is(err, context.Canceled) {
