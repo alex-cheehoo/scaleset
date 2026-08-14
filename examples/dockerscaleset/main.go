@@ -116,19 +116,10 @@ func run(ctx context.Context, c Config) error {
 	// Set the user agent for the scaleset client now that we have the scale set ID
 	scalesetClient.SetSystemInfo(systemInfo(scaleSet.ID))
 
-	defer func() {
-		logger.Info(
-			"Deleting runner scale set",
-			slog.Int("scaleSetID", scaleSet.ID),
-		)
-		if err := scalesetClient.DeleteRunnerScaleSet(context.WithoutCancel(ctx), scaleSet.ID); err != nil {
-			slog.Error(
-				"Failed to delete runner scale set",
-				slog.Int("scaleSetID", scaleSet.ID),
-				slog.String("error", err.Error()),
-			)
-		}
-	}()
+	// The scale set is NOT deleted on shutdown. Deleting it strands every job
+	// it had acquired but not started — they sit queued until GitHub's internal
+	// timeout — and a restart recreates it anyway via get-or-create. ARC never
+	// deletes its scale sets either. Upstream's defer here is demo behaviour.
 
 	dockerClient, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
 	if err != nil {
