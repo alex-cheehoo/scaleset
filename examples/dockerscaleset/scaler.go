@@ -381,6 +381,7 @@ func (a *Scaler) probeDind(ctx context.Context, dindName string) (bool, error) {
 // removeDindResources force-removes the dind container, a leftover init
 // container, and the shared volumes. Failures are logged but never propagated.
 func (a *Scaler) removeDindResources(ctx context.Context, runnerName string) {
+	a.removeRunnerRegistration(ctx, runnerName)
 	for _, c := range []string{runnerName + "-dind", runnerName + "-init"} {
 		if err := a.dockerClient.ContainerRemove(ctx, c, container.RemoveOptions{Force: true}); err != nil && !dockerclient.IsErrNotFound(err) {
 			a.logger.Warn("Failed to remove container", slog.String("name", c), slog.String("error", err.Error()))
@@ -390,6 +391,21 @@ func (a *Scaler) removeDindResources(ctx context.Context, runnerName string) {
 		if err := a.dockerClient.VolumeRemove(ctx, v, true); err != nil {
 			a.logger.Warn("Failed to remove volume", slog.String("volume", v), slog.String("error", err.Error()))
 		}
+	}
+}
+
+// removeRunnerRegistration deletes the GitHub-side registration for a runner
+// this process is force-removing. A JIT registration is born when the config
+// is generated and normally dies when the runner finishes its job; a runner
+// killed before that leaves an offline corpse GitHub only collects after a
+// day. Absence is success — the runner may have deregistered itself.
+func (a *Scaler) removeRunnerRegistration(ctx context.Context, name string) {
+	ref, err := a.scalesetClient.GetRunnerByName(ctx, name)
+	if err != nil || ref == nil {
+		return
+	}
+	if err := a.scalesetClient.RemoveRunner(ctx, int64(ref.ID)); err != nil {
+		a.logger.Warn("Failed to deregister runner", slog.String("runner", name), slog.String("error", err.Error()))
 	}
 }
 
