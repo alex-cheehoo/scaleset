@@ -173,12 +173,23 @@ func run(ctx context.Context, c Config) error {
 	defer sessionClient.Close(context.Background())
 
 	// Jobs queued while no session existed never generate a message for this
-	// session — messages fire on transitions only. Sweep the backlog once and
-	// acquire it, so a controller restart or a VM recreate does not strand
-	// whatever queued during the gap.
-	if backlog, err := scalesetClient.GetAcquirableJobs(ctx, scaleSet.ID); err != nil {
-		logger.Warn("Failed to list acquirable jobs; queued backlog may be stranded", slog.String("error", err.Error()))
-	} else if backlog.Count > 0 {
+	// session — messages fire on transitions only. Worse, a job that queues
+	// moments around session creation can miss BOTH buckets: observed a job
+	// queued 31s before boot that showed assigned=0, acquirable=0 at startup
+	// and then never produced a message — stranded until a manual rerun. So
+	// sweep at startup and keep sweeping: a lost message degrades to a ≤60s
+	// pickup delay instead of a stranded run. GetAcquirableJobs is a cheap
+	// sessionless GET; AcquireJobs only runs when there is work (it shares
+	// the session mutex with the long poll, so it may wait for one cycle).
+	sweepBacklog := func(ctx context.Context) {
+		backlog, err := scalesetClient.GetAcquirableJobs(ctx, scaleSet.ID)
+		if err != nil {
+			logger.Warn("Failed to list acquirable jobs; queued backlog may be stranded", slog.String("error", err.Error()))
+			return
+		}
+		if backlog.Count == 0 {
+			return
+		}
 		ids := make([]int64, 0, len(backlog.Jobs))
 		for _, j := range backlog.Jobs {
 			ids = append(ids, j.RunnerRequestID)
@@ -186,10 +197,23 @@ func run(ctx context.Context, c Config) error {
 		acquired, err := sessionClient.AcquireJobs(ctx, ids)
 		if err != nil {
 			logger.Warn("Failed to acquire backlog jobs", slog.String("error", err.Error()))
-		} else {
-			logger.Info("Acquired queued backlog", slog.Int("available", backlog.Count), slog.Int("acquired", len(acquired)))
+			return
 		}
+		logger.Info("Acquired queued backlog", slog.Int("available", backlog.Count), slog.Int("acquired", len(acquired)))
 	}
+	sweepBacklog(ctx)
+	go func() {
+		ticker := time.NewTicker(time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				sweepBacklog(ctx)
+			}
+		}
+	}()
 
 	logger.Info("Initializing listener")
 	listener, err := listener.New(sessionClient, listener.Config{
