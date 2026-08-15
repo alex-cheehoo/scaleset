@@ -172,8 +172,12 @@ func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 
 // removeContainer deletes a runner container, treating an already-removed one
 // as success — under AutoRemove that is the normal outcome, not a failure.
+// RemoveVolumes reaps the container's ANONYMOUS volumes with it — the dind
+// image declares VOLUME /var/lib/docker, so every dind otherwise strands a
+// ~1.4GB anonymous volume per job (measured: 190 of them filled a 64GiB disk
+// in a day). Named volumes are never touched by this flag.
 func (a *Scaler) removeContainer(ctx context.Context, containerID string) error {
-	err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+	err := a.dockerClient.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	if err != nil && !dockerclient.IsErrNotFound(err) {
 		return err
 	}
@@ -290,7 +294,7 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	if err := a.dockerClient.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
 		// A created-but-never-started container never exits, so AutoRemove
 		// never fires — without this it leaks and pins the volumes with it.
-		if rmErr := a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), c.ID, container.RemoveOptions{Force: true}); rmErr != nil {
+		if rmErr := a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}); rmErr != nil {
 			a.logger.Warn("Failed to remove unstarted runner container", slog.String("name", name), slog.String("error", rmErr.Error()))
 		}
 		cleanup()
@@ -327,7 +331,7 @@ func (a *Scaler) chownVolumes(ctx context.Context, name, volWork string) error {
 		return fmt.Errorf("failed to create init container: %w", err)
 	}
 	defer func() {
-		_ = a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), c.ID, container.RemoveOptions{Force: true})
+		_ = a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	}()
 
 	if err := a.dockerClient.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
@@ -399,7 +403,7 @@ func (a *Scaler) PopulateSharedExternals(ctx context.Context) error {
 		return fmt.Errorf("failed to create externals init container: %w", err)
 	}
 	defer func() {
-		_ = a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), c.ID, container.RemoveOptions{Force: true})
+		_ = a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), c.ID, container.RemoveOptions{Force: true, RemoveVolumes: true})
 	}()
 	if err := a.dockerClient.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
 		return fmt.Errorf("failed to start externals init container: %w", err)
@@ -514,7 +518,7 @@ func (a *Scaler) probeDind(ctx context.Context, dindName string) (bool, error) {
 func (a *Scaler) removeDindResources(ctx context.Context, runnerName string) {
 	a.removeRunnerRegistration(ctx, runnerName)
 	for _, c := range []string{runnerName + "-dind", runnerName + "-init"} {
-		if err := a.dockerClient.ContainerRemove(ctx, c, container.RemoveOptions{Force: true}); err != nil && !dockerclient.IsErrNotFound(err) {
+		if err := a.dockerClient.ContainerRemove(ctx, c, container.RemoveOptions{Force: true, RemoveVolumes: true}); err != nil && !dockerclient.IsErrNotFound(err) {
 			a.logger.Warn("Failed to remove container", slog.String("name", c), slog.String("error", err.Error()))
 		}
 	}
@@ -584,6 +588,21 @@ func (a *Scaler) reapOrphans(ctx context.Context) {
 		}
 		a.logger.Info("Reaping orphaned dind resources", slog.String("runner", name))
 		a.removeDindResources(ctx, name)
+	}
+
+	// Backstop for anonymous volumes stranded by paths RemoveVolumes cannot
+	// cover — a controller killed while its containers were later removed
+	// without the flag. Anonymous volumes carry no owner label, so the
+	// label-driven sweep above never sees them. Docker's default prune scope
+	// is anonymous-only: named volumes (externals, registry cache, per-runner
+	// sock/work) are untouched, and a volume referenced by ANY container,
+	// running or created, is not dangling.
+	if report, err := a.dockerClient.VolumesPrune(ctx, filters.NewArgs()); err != nil {
+		a.logger.Warn("Orphan sweep: anonymous volume prune failed", slog.String("error", err.Error()))
+	} else if report.SpaceReclaimed > 0 {
+		a.logger.Info("Pruned stranded anonymous volumes",
+			slog.Int("count", len(report.VolumesDeleted)),
+			slog.Uint64("reclaimedBytes", report.SpaceReclaimed))
 	}
 }
 
