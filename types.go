@@ -130,6 +130,20 @@ type RunnerScaleSetSession struct {
 	Statistics              *RunnerScaleSetStatistic `json:"statistics,omitempty"`
 }
 
+type AcquirableJobList struct {
+	Count int             `json:"count"`
+	Jobs  []AcquirableJob `json:"value"`
+}
+
+type AcquirableJob struct {
+	RunnerRequestID int64    `json:"runnerRequestId"`
+	OwnerName       string   `json:"ownerName"`
+	RepositoryName  string   `json:"repositoryName"`
+	AcquireJobURL   string   `json:"acquireJobUrl"`
+	MessageType     string   `json:"messageType"`
+	RunnerLabels    []string `json:"runnerRequestLabels"`
+}
+
 type RunnerScaleSetStatistic struct {
 	TotalAvailableJobs     int `json:"totalAvailableJobs"`
 	TotalAcquiredJobs      int `json:"totalAcquiredJobs"`

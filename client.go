@@ -638,6 +638,44 @@ func (c *Client) GenerateJitRunnerConfig(ctx context.Context, jitRunnerSetting *
 }
 
 // GetRunner fetches a runner by its ID. This can be used to check if a runner exists.
+// GetAcquirableJobs lists jobs queued against the scale set that no session
+// has acquired. Messages only fire on transitions, so jobs queued while no
+// session existed generate nothing for a later session — the startup sweep
+// uses this to find them. Mirrors the method this library lost when it was
+// extracted from actions-runner-controller.
+func (c *Client) GetAcquirableJobs(ctx context.Context, runnerScaleSetID int) (*AcquirableJobList, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	path := fmt.Sprintf("/%s/%d/acquirablejobs", scaleSetEndpoint, runnerScaleSetID)
+
+	req, err := c.newActionsServiceRequest(ctx, http.MethodGet, path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create new actions service request: %w", err)
+	}
+
+	resp, err := c.do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to issue the request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent {
+		return &AcquirableJobList{Count: 0, Jobs: []AcquirableJob{}}, nil
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, newRequestResponseError(req, resp, fmt.Errorf("unexpected status code: %d", resp.StatusCode))
+	}
+
+	var jobs AcquirableJobList
+	if err := json.NewDecoder(resp.Body).Decode(&jobs); err != nil {
+		return nil, newRequestResponseError(req, resp, fmt.Errorf("failed to decode acquirable jobs: %w", err))
+	}
+
+	return &jobs, nil
+}
+
 func (c *Client) GetRunner(ctx context.Context, runnerID int) (*RunnerReference, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
