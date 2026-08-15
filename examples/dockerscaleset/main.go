@@ -215,6 +215,10 @@ func run(ctx context.Context, c Config) error {
 		scaleSetID:     scaleSet.ID,
 	}
 
+	if err := scaler.PopulateSharedExternals(ctx); err != nil {
+		return fmt.Errorf("failed to populate shared externals: %w", err)
+	}
+
 	defer scaler.shutdown(context.WithoutCancel(ctx))
 
 	// Sweep for dind containers and volumes orphaned by a previous process —

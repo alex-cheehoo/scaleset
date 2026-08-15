@@ -21,6 +21,20 @@ import (
 // dindImage is pulled once at startup; ContainerCreate does not pull.
 const dindImage = "docker:dind"
 
+// sharedExternalsVolume holds one read-only copy of the runner's externals
+// (node runtimes etc, ~1 GB of small files). It used to be copied per runner
+// by an init container; seven concurrent copies through the OS disk cost four
+// minutes per creation wave and were the whole reason runner spin-up felt
+// slow. Populated once at controller startup, mounted read-only into every
+// dind.
+const sharedExternalsVolume = "gha-externals"
+
+// registryMirror is the host-side pull-through cache. Every fresh dind pulls
+// buildkit and base images from scratch; the mirror turns those into LAN
+// hits. 172.17.0.1 is the default bridge gateway — how a dind reaches the
+// host.
+const registryMirror = "172.17.0.1:5000"
+
 // ownerLabel marks every dind container and volume with the runner it belongs
 // to. Ownership must live on the Docker side, not only in runnerState's
 // in-memory maps: the maps die with the process, and resources only they knew
@@ -188,13 +202,12 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	// Create shared volumes for the dind sidecar architecture.
 	volSock := name + "-sock"
 	volWork := name + "-work"
-	volExternals := name + "-externals"
 
 	cleanup := func() {
 		a.removeDindResources(context.WithoutCancel(ctx), name)
 	}
 
-	for _, v := range []string{volSock, volWork, volExternals} {
+	for _, v := range []string{volSock, volWork} {
 		if _, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{
 			Name:   v,
 			Labels: map[string]string{ownerLabel: name},
@@ -204,14 +217,14 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 		}
 	}
 
-	// Init: copy runner externals into the shared volume.
-	if err := a.runInitContainer(ctx, name, volExternals, volWork); err != nil {
+	// Ownership: fresh volumes are root:0755 and the runner is uid 1001.
+	if err := a.chownVolumes(ctx, name, volWork); err != nil {
 		cleanup()
-		return "", fmt.Errorf("failed to run init container: %w", err)
+		return "", fmt.Errorf("failed to prepare volumes: %w", err)
 	}
 
 	// Start the dind sidecar.
-	if err := a.startDind(ctx, name, volSock, volWork, volExternals); err != nil {
+	if err := a.startDind(ctx, name, volSock, volWork); err != nil {
 		cleanup()
 		return "", fmt.Errorf("failed to start dind container: %w", err)
 	}
@@ -281,26 +294,22 @@ func (a *Scaler) startRunner(ctx context.Context) (string, error) {
 	return name, nil
 }
 
-// runInitContainer copies runner externals into the shared volume so dind can
-// access them.
-func (a *Scaler) runInitContainer(ctx context.Context, name, volExternals, volWork string) error {
+// chownVolumes hands the fresh work volume to the runner user. Fresh volumes
+// are root:0755 and the runner is uid 1001; without this npm dies on its own
+// cache. Seconds, not minutes — the gigabyte externals copy that used to live
+// in this step is gone, replaced by the shared read-only volume.
+func (a *Scaler) chownVolumes(ctx context.Context, name, volWork string) error {
 	initName := name + "-init"
 	c, err := a.dockerClient.ContainerCreate(
 		ctx,
 		&container.Config{
-			Image: a.runnerImage,
-			// Root, unlike ARC's init container: a k8s emptyDir is 0777, but a
-			// fresh Docker volume mounted where the image has no directory is
-			// root:0755 — as uid 1001 the cp exits 1 and the runner would later
-			// fail to write _work. Copy as root, then hand both to the runner.
-			User: "0",
-			Cmd: []string{"sh", "-c",
-				"cp -r /home/runner/externals/. /home/runner/tmpDir/ && chown -R runner:runner /home/runner/tmpDir /home/runner/_work"},
+			Image:  a.runnerImage,
+			User:   "0",
+			Cmd:    []string{"chown", "runner:runner", "/home/runner/_work"},
 			Labels: map[string]string{ownerLabel: name},
 		},
 		&container.HostConfig{
 			Mounts: []mount.Mount{
-				{Type: mount.TypeVolume, Source: volExternals, Target: "/home/runner/tmpDir"},
 				{Type: mount.TypeVolume, Source: volWork, Target: "/home/runner/_work"},
 			},
 		},
@@ -330,7 +339,61 @@ func (a *Scaler) runInitContainer(ctx context.Context, name, volExternals, volWo
 	return nil
 }
 
-func (a *Scaler) startDind(ctx context.Context, name, volSock, volWork, volExternals string) error {
+// PopulateSharedExternals fills the shared read-only externals volume from the
+// runner image, once, at startup. An existing populated volume is reused; it
+// is refreshed only when absent, so a runner-image update that changes
+// externals needs the volume removed (the next boot then rebuilds it).
+func (a *Scaler) PopulateSharedExternals(ctx context.Context) error {
+	vols, err := a.dockerClient.VolumeList(ctx, volume.ListOptions{})
+	if err == nil {
+		for _, v := range vols.Volumes {
+			if v.Name == sharedExternalsVolume {
+				a.logger.Info("Reusing shared externals volume")
+				return nil
+			}
+		}
+	}
+	if _, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: sharedExternalsVolume}); err != nil {
+		return fmt.Errorf("failed to create shared externals volume: %w", err)
+	}
+	c, err := a.dockerClient.ContainerCreate(
+		ctx,
+		&container.Config{
+			Image: a.runnerImage,
+			User:  "0",
+			Cmd:   []string{"sh", "-c", "cp -r /home/runner/externals/. /mnt/ext/ && chown -R runner:runner /mnt/ext"},
+		},
+		&container.HostConfig{
+			Mounts: []mount.Mount{
+				{Type: mount.TypeVolume, Source: sharedExternalsVolume, Target: "/mnt/ext"},
+			},
+		},
+		nil, nil,
+		"gha-externals-init",
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create externals init container: %w", err)
+	}
+	defer func() {
+		_ = a.dockerClient.ContainerRemove(context.WithoutCancel(ctx), c.ID, container.RemoveOptions{Force: true})
+	}()
+	if err := a.dockerClient.ContainerStart(ctx, c.ID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("failed to start externals init container: %w", err)
+	}
+	waitCh, errCh := a.dockerClient.ContainerWait(ctx, c.ID, container.WaitConditionNotRunning)
+	select {
+	case result := <-waitCh:
+		if result.StatusCode != 0 {
+			return fmt.Errorf("externals init exited with status %d", result.StatusCode)
+		}
+	case err := <-errCh:
+		return fmt.Errorf("waiting for externals init: %w", err)
+	}
+	a.logger.Info("Populated shared externals volume")
+	return nil
+}
+
+func (a *Scaler) startDind(ctx context.Context, name, volSock, volWork string) error {
 	dindName := name + "-dind"
 	// Paths must match between dind and runner so daemon bind mounts resolve correctly.
 	c, err := a.dockerClient.ContainerCreate(
@@ -338,7 +401,11 @@ func (a *Scaler) startDind(ctx context.Context, name, volSock, volWork, volExter
 		&container.Config{
 			Image: dindImage,
 			// --group=123: matches the docker group gid inside the runner image.
-			Cmd:    []string{"dockerd", "--host=unix:///var/run/docker.sock", "--group=123"},
+			// The mirror turns every Docker Hub pull (buildkit, base images) a
+			// fresh daemon makes into a LAN hit on the host's pull-through cache.
+			Cmd: []string{"dockerd", "--host=unix:///var/run/docker.sock", "--group=123",
+				"--registry-mirror=http://" + registryMirror,
+				"--insecure-registry=" + registryMirror},
 			Labels: map[string]string{ownerLabel: name},
 		},
 		&container.HostConfig{
@@ -346,7 +413,7 @@ func (a *Scaler) startDind(ctx context.Context, name, volSock, volWork, volExter
 			Mounts: []mount.Mount{
 				{Type: mount.TypeVolume, Source: volSock, Target: "/var/run"},
 				{Type: mount.TypeVolume, Source: volWork, Target: "/home/runner/_work"},
-				{Type: mount.TypeVolume, Source: volExternals, Target: "/home/runner/externals"},
+				{Type: mount.TypeVolume, Source: sharedExternalsVolume, Target: "/home/runner/externals", ReadOnly: true},
 			},
 		},
 		nil, nil,
@@ -427,7 +494,7 @@ func (a *Scaler) removeDindResources(ctx context.Context, runnerName string) {
 			a.logger.Warn("Failed to remove container", slog.String("name", c), slog.String("error", err.Error()))
 		}
 	}
-	for _, v := range []string{runnerName + "-sock", runnerName + "-work", runnerName + "-externals"} {
+	for _, v := range []string{runnerName + "-sock", runnerName + "-work"} {
 		if err := a.dockerClient.VolumeRemove(ctx, v, true); err != nil {
 			a.logger.Warn("Failed to remove volume", slog.String("volume", v), slog.String("error", err.Error()))
 		}
