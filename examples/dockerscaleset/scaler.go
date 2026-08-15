@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -27,10 +28,18 @@ const dindImage = "docker:dind"
 const ownerLabel = "dockerscaleset.runner"
 
 type Scaler struct {
-	// setupMu serialises startRunner against reapOrphans: mid-setup a runner's
-	// dind and volumes exist while the runner container does not yet, which is
-	// exactly what the sweep reads as an orphan.
-	setupMu        sync.Mutex
+	// inflight names runners currently being built, so reapOrphans skips them
+	// — mid-setup a runner's dind and volumes exist while its container does
+	// not, which is exactly what the sweep reads as an orphan. A name set
+	// instead of a lock: creators never block each other or the sweep, and the
+	// sweep never freezes creation. (An RWMutex here stalls every new creation
+	// for up to two minutes whenever the sweep queues behind a slow dind wait —
+	// Go's writer-priority blocks new readers while a writer waits.)
+	inflightMu sync.Mutex
+	inflight   map[string]struct{}
+	// pending counts creations in flight, so a burst of messages does not
+	// over-provision before the first runners register in the maps.
+	pending        atomic.Int64
 	runners        runnerState
 	runnerImage    string
 	scaleSetID     int
@@ -42,7 +51,7 @@ type Scaler struct {
 }
 
 func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
-	currentCount := a.runners.count()
+	currentCount := a.runners.count() + int(a.pending.Load())
 	targetRunnerCount := min(a.maxRunners, a.minRunners+count)
 
 	switch {
@@ -50,7 +59,12 @@ func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		// No scaling needed
 		return currentCount, nil
 	case targetRunnerCount > currentCount:
-		// Scale up
+		// Scale up. Creations run concurrently and the listener is not blocked
+		// on any of them — ARC's listener patches the desired count and moves
+		// on, leaving startup and readiness to each pod. A failed creation
+		// cleans itself up and is retried implicitly: the next message
+		// recomputes the gap. It must never kill the listener; that stranded
+		// every acquired job each time one dind timed out under load.
 		scaleUp := targetRunnerCount - currentCount
 		a.logger.Info(
 			"Scaling up runners",
@@ -60,9 +74,18 @@ func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, 
 		)
 
 		for range scaleUp {
-			if _, err := a.startRunner(ctx); err != nil {
-				return 0, fmt.Errorf("failed to start runner: %w", err)
-			}
+			a.pending.Add(1)
+			go func() {
+				defer a.pending.Add(-1)
+				// A hard budget for the whole build. Without one, a hung Docker
+				// API call keeps the goroutine (and its inflight entry) alive
+				// forever, silently disabling scale-up until a restart.
+				bctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Minute)
+				defer cancel()
+				if _, err := a.startRunner(bctx); err != nil {
+					a.logger.Error("Failed to start runner", slog.String("error", err.Error()))
+				}
+			}()
 		}
 
 		return a.runners.count(), nil
@@ -91,10 +114,16 @@ func (a *Scaler) HandleJobStarted(ctx context.Context, jobInfo *scaleset.JobStar
 func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCompleted) error {
 	a.logger.Info("Job completed", slog.Int64("runnerRequestId", jobInfo.RunnerRequestID), slog.String("jobId", jobInfo.JobID))
 
+	// The removals below call both the Docker API and GitHub (deregistration),
+	// and the GitHub calls share the client's global mutex with any JIT config
+	// generation in flight — under load that lock is held through minutes of
+	// HTTP retries. This handler runs synchronously in the listener's message
+	// loop, so the cleanup goes to a goroutine; everything it does is
+	// idempotent and the periodic sweep backstops a failure.
 	containerID := a.runners.markDone(jobInfo.RunnerName)
 	if containerID == "" {
 		a.logger.Warn("Job completed on a runner this process does not own", slog.String("runner", jobInfo.RunnerName))
-		a.removeDindResources(ctx, jobInfo.RunnerName)
+		go a.removeDindResources(context.WithoutCancel(ctx), jobInfo.RunnerName)
 		return nil
 	}
 	// Not fatal. With AutoRemove the daemon owns the removal and this call is
@@ -104,16 +133,18 @@ func (a *Scaler) HandleJobCompleted(ctx context.Context, jobInfo *scaleset.JobCo
 	// Returning any of those kills the listener, and the shutdown that follows
 	// force-removes every busy runner, so one lost race fails every job then
 	// running.
-	if err := a.removeContainer(ctx, containerID); err != nil {
-		a.logger.Warn(
-			"Runner container removal failed; the daemon's AutoRemove is authoritative",
-			slog.String("name", jobInfo.RunnerName),
-			slog.String("containerID", containerID),
-			slog.String("error", err.Error()),
-		)
-	}
-
-	a.removeDindResources(ctx, jobInfo.RunnerName)
+	go func() {
+		cctx := context.WithoutCancel(ctx)
+		if err := a.removeContainer(cctx, containerID); err != nil {
+			a.logger.Warn(
+				"Runner container removal failed; the daemon's AutoRemove is authoritative",
+				slog.String("name", jobInfo.RunnerName),
+				slog.String("containerID", containerID),
+				slog.String("error", err.Error()),
+			)
+		}
+		a.removeDindResources(cctx, jobInfo.RunnerName)
+	}()
 
 	return nil
 }
@@ -129,10 +160,19 @@ func (a *Scaler) removeContainer(ctx context.Context, containerID string) error 
 }
 
 func (a *Scaler) startRunner(ctx context.Context) (string, error) {
-	a.setupMu.Lock()
-	defer a.setupMu.Unlock()
-
 	name := fmt.Sprintf("runner-%s", uuid.NewString()[:8])
+
+	a.inflightMu.Lock()
+	if a.inflight == nil {
+		a.inflight = make(map[string]struct{})
+	}
+	a.inflight[name] = struct{}{}
+	a.inflightMu.Unlock()
+	defer func() {
+		a.inflightMu.Lock()
+		delete(a.inflight, name)
+		a.inflightMu.Unlock()
+	}()
 
 	jit, err := a.scalesetClient.GenerateJitRunnerConfig(
 		ctx,
@@ -415,9 +455,6 @@ func (a *Scaler) removeRunnerRegistration(ctx context.Context, name string) {
 // forever. The runner container doubles as a liveness anchor: while it exists
 // its job may still be running, so its resources are left alone.
 func (a *Scaler) reapOrphans(ctx context.Context) {
-	a.setupMu.Lock()
-	defer a.setupMu.Unlock()
-
 	labelFilter := filters.NewArgs(filters.Arg("label", ownerLabel))
 
 	owners := map[string]bool{}
@@ -442,6 +479,12 @@ func (a *Scaler) reapOrphans(ctx context.Context) {
 	}
 
 	for name := range owners {
+		a.inflightMu.Lock()
+		_, building := a.inflight[name]
+		a.inflightMu.Unlock()
+		if building {
+			continue // mid-setup, not an orphan
+		}
 		if _, err := a.dockerClient.ContainerInspect(ctx, name); err == nil {
 			continue // runner still exists; its job may be running
 		} else if !dockerclient.IsErrNotFound(err) {
