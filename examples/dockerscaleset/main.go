@@ -172,6 +172,25 @@ func run(ctx context.Context, c Config) error {
 	}
 	defer sessionClient.Close(context.Background())
 
+	// Jobs queued while no session existed never generate a message for this
+	// session — messages fire on transitions only. Sweep the backlog once and
+	// acquire it, so a controller restart or a VM recreate does not strand
+	// whatever queued during the gap.
+	if backlog, err := scalesetClient.GetAcquirableJobs(ctx, scaleSet.ID); err != nil {
+		logger.Warn("Failed to list acquirable jobs; queued backlog may be stranded", slog.String("error", err.Error()))
+	} else if backlog.Count > 0 {
+		ids := make([]int64, 0, len(backlog.Jobs))
+		for _, j := range backlog.Jobs {
+			ids = append(ids, j.RunnerRequestID)
+		}
+		acquired, err := sessionClient.AcquireJobs(ctx, ids)
+		if err != nil {
+			logger.Warn("Failed to acquire backlog jobs", slog.String("error", err.Error()))
+		} else {
+			logger.Info("Acquired queued backlog", slog.Int("available", backlog.Count), slog.Int("acquired", len(acquired)))
+		}
+	}
+
 	logger.Info("Initializing listener")
 	listener, err := listener.New(sessionClient, listener.Config{
 		ScaleSetID: scaleSet.ID,
