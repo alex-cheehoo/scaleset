@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,13 +22,16 @@ import (
 // dindImage is pulled once at startup; ContainerCreate does not pull.
 const dindImage = "docker:dind"
 
-// sharedExternalsVolume holds one read-only copy of the runner's externals
-// (node runtimes etc, ~1 GB of small files). It used to be copied per runner
-// by an init container; seven concurrent copies through the OS disk cost four
-// minutes per creation wave and were the whole reason runner spin-up felt
-// slow. Populated once at controller startup, mounted read-only into every
-// dind.
-const sharedExternalsVolume = "gha-externals"
+// sharedExternalsPrefix names the read-only externals volume, keyed to the
+// runner image ID: gha-externals-<12 hex of the image ID>. One copy of the
+// runner's externals (node runtimes, ~500 MB of small files), populated once
+// at startup, mounted read-only into every dind. Keying to the image makes a
+// runner-image update self-invalidating — the name changes, a fresh volume is
+// populated, and the stale one has no runner container so the orphan sweep
+// collects it. (ARC's issue #3818 recommends baking externals into a custom
+// dind image, which must be manually re-baked per runner-image bump; the
+// digest key gets the same freshness without a second image to maintain.)
+const sharedExternalsPrefix = "gha-externals-"
 
 // registryMirror is the host-side pull-through cache. Every fresh dind pulls
 // buildkit and base images from scratch; the mirror turns those into LAN
@@ -53,15 +57,18 @@ type Scaler struct {
 	inflight   map[string]struct{}
 	// pending counts creations in flight, so a burst of messages does not
 	// over-provision before the first runners register in the maps.
-	pending        atomic.Int64
-	runners        runnerState
-	runnerImage    string
-	scaleSetID     int
-	dockerClient   *dockerclient.Client
-	scalesetClient *scaleset.Client
-	minRunners     int
-	maxRunners     int
-	logger         *slog.Logger
+	pending atomic.Int64
+	// externalsVolume is the digest-keyed shared externals volume name,
+	// resolved by PopulateSharedExternals before the listener starts.
+	externalsVolume string
+	runners         runnerState
+	runnerImage     string
+	scaleSetID      int
+	dockerClient    *dockerclient.Client
+	scalesetClient  *scaleset.Client
+	minRunners      int
+	maxRunners      int
+	logger          *slog.Logger
 }
 
 func (a *Scaler) HandleDesiredRunnerCount(ctx context.Context, count int) (int, error) {
@@ -339,21 +346,38 @@ func (a *Scaler) chownVolumes(ctx context.Context, name, volWork string) error {
 	return nil
 }
 
-// PopulateSharedExternals fills the shared read-only externals volume from the
-// runner image, once, at startup. An existing populated volume is reused; it
-// is refreshed only when absent, so a runner-image update that changes
-// externals needs the volume removed (the next boot then rebuilds it).
+// PopulateSharedExternals fills the shared read-only externals volume from
+// the runner image, once, at startup. The volume name embeds the runner image
+// ID, so an image update populates a fresh volume automatically; stale
+// generations are deleted here (in-use ones are skipped and caught next boot).
 func (a *Scaler) PopulateSharedExternals(ctx context.Context) error {
+	img, err := a.dockerClient.ImageInspect(ctx, a.runnerImage)
+	if err != nil {
+		return fmt.Errorf("failed to inspect runner image: %w", err)
+	}
+	id := strings.TrimPrefix(img.ID, "sha256:")
+	if len(id) > 12 {
+		id = id[:12]
+	}
+	a.externalsVolume = sharedExternalsPrefix + id
+
 	vols, err := a.dockerClient.VolumeList(ctx, volume.ListOptions{})
 	if err == nil {
 		for _, v := range vols.Volumes {
-			if v.Name == sharedExternalsVolume {
-				a.logger.Info("Reusing shared externals volume")
+			if v.Name == a.externalsVolume {
+				a.logger.Info("Reusing shared externals volume", slog.String("volume", a.externalsVolume))
 				return nil
+			}
+			if strings.HasPrefix(v.Name, sharedExternalsPrefix) {
+				if err := a.dockerClient.VolumeRemove(ctx, v.Name, false); err != nil {
+					a.logger.Warn("Stale externals volume not removed (likely in use)", slog.String("volume", v.Name))
+				} else {
+					a.logger.Info("Removed stale externals volume", slog.String("volume", v.Name))
+				}
 			}
 		}
 	}
-	if _, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: sharedExternalsVolume}); err != nil {
+	if _, err := a.dockerClient.VolumeCreate(ctx, volume.CreateOptions{Name: a.externalsVolume}); err != nil {
 		return fmt.Errorf("failed to create shared externals volume: %w", err)
 	}
 	c, err := a.dockerClient.ContainerCreate(
@@ -365,7 +389,7 @@ func (a *Scaler) PopulateSharedExternals(ctx context.Context) error {
 		},
 		&container.HostConfig{
 			Mounts: []mount.Mount{
-				{Type: mount.TypeVolume, Source: sharedExternalsVolume, Target: "/mnt/ext"},
+				{Type: mount.TypeVolume, Source: a.externalsVolume, Target: "/mnt/ext"},
 			},
 		},
 		nil, nil,
@@ -389,7 +413,7 @@ func (a *Scaler) PopulateSharedExternals(ctx context.Context) error {
 	case err := <-errCh:
 		return fmt.Errorf("waiting for externals init: %w", err)
 	}
-	a.logger.Info("Populated shared externals volume")
+	a.logger.Info("Populated shared externals volume", slog.String("volume", a.externalsVolume))
 	return nil
 }
 
@@ -413,7 +437,7 @@ func (a *Scaler) startDind(ctx context.Context, name, volSock, volWork string) e
 			Mounts: []mount.Mount{
 				{Type: mount.TypeVolume, Source: volSock, Target: "/var/run"},
 				{Type: mount.TypeVolume, Source: volWork, Target: "/home/runner/_work"},
-				{Type: mount.TypeVolume, Source: sharedExternalsVolume, Target: "/home/runner/externals", ReadOnly: true},
+				{Type: mount.TypeVolume, Source: a.externalsVolume, Target: "/home/runner/externals", ReadOnly: true},
 			},
 		},
 		nil, nil,
