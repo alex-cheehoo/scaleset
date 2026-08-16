@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/actions/scaleset"
@@ -277,7 +278,12 @@ var cmd = &cobra.Command{
 	Long: `This is an example CLI application that demonstrates how to scale
 runners using Docker.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt)
+		// SIGTERM included: docker stop sends it, and without the graceful
+		// path the session defer never runs — the message session leaks on
+		// GitHub's side and eats the dispatch messages for every job queued
+		// until it expires. The idle self-deallocate stops this container
+		// first for exactly that reason.
+		ctx, cancel := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer cancel()
 
 		if err := cfg.Validate(); err != nil {
